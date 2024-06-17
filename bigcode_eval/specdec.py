@@ -7,7 +7,7 @@ from typing import List
 
 
 from bigcode_eval import tasks
-from bigcode_eval.generation import parallel_generations
+from bigcode_eval.acceptance_rate import parallel_generations
 
 _WARNING = """
 ################################################################################
@@ -28,9 +28,10 @@ Once you have read this disclaimer and taken appropriate precautions, set the ar
 """
 
 class Evaluator:
-    def __init__(self, accelerator, model, tokenizer, args):
+    def __init__(self, accelerator, model, draft, tokenizer, args):
         self.accelerator = accelerator
         self.model = model
+        self.draft = draft
         self.tokenizer = tokenizer
         self.args = args
 
@@ -40,8 +41,8 @@ class Evaluator:
         # code evaluation permission
         self.allow_code_execution = args.allow_code_execution
 
-    def generate_text(self, task_name, intermediate_generations=None
-                      ,num_shots= None):# @edited: vashisth
+    def generate_text(self, task_name, intermediate_generations=None,
+                      num_shots= None):# @edited: vashisth, rsadhukh
         
         task = tasks.get_task(task_name, self.args)
         dataset = task.get_dataset()
@@ -68,11 +69,12 @@ class Evaluator:
         intermediate_save_generations_path = f"{os.path.splitext(self.args.save_generations_path)[0]}_{task_name}_intermediate.json"
         curr_sample_idx = len(curr_generations)
 
-        generations = parallel_generations(
+        generations, draft_generations, acceptance_rate = parallel_generations(
             task,
             dataset,
             self.accelerator,
             self.model,
+            self.draft,
             self.tokenizer,
             n_tasks=n_tasks,
             args=self.args,
@@ -82,26 +84,40 @@ class Evaluator:
             intermediate_save_generations_path=intermediate_save_generations_path,
             num_shots=num_shots, # edited: vashisth
             task_name=task_name, # edited: vashisth
-        )
+        )       
 
         if len(generations[0]) > self.args.n_samples:
             generations = [l[: self.args.n_samples] for l in generations]
             warnings.warn(
                 f"Number of tasks wasn't proportional to number of devices, we removed extra predictions to only keep nsamples={self.args.n_samples}"
             )
-        return generations, references
+
+        if len(draft_generations[0]) > self.args.n_samples:
+            draft_generations = [l[: self.args.n_samples] for l in draft_generations]
+            warnings.warn(
+                f"Number of tasks wasn't proportional to number of devices, we removed extra predictions to only keep nsamples={self.args.n_samples}"
+            )
+
+        return generations, draft_generations, references, acceptance_rate
 
     def evaluate(self, task_name, intermediate_generations=None):
         task = tasks.get_task(task_name, self.args)
         if task.requires_execution and not self.allow_code_execution:
             raise ValueError(_WARNING)
 
-        generations, references = self.generate_text(task_name, intermediate_generations=intermediate_generations, num_shots=self.args.num_shots)# @edited: rsadhukh
+        # @edited: rsadhukh
+        # target generations
+        generations, draft_generations, references, acceptance_rate = self.generate_text(task_name, 
+                                                                        intermediate_generations=intermediate_generations, 
+                                                                        num_shots=self.args.num_shots)
 
         if self.accelerator.is_main_process:
             if not self.args.load_generations_path:
-                save_generations_path = f"{os.path.splitext(self.args.save_generations_path)[0]}_{task_name}.json"
+                save_generations_path = f"{os.path.splitext(self.args.save_generations_path)[0]}_{task_name}_target.json"
                 self.save_json_files(generations, references, save_generations_path, f"references_{task_name}.json")
+
+                draft_save_generations_path = f"{os.path.splitext(self.args.save_generations_path)[0]}_{task_name}_draft.json"
+                self.save_json_files(draft_generations, references, draft_save_generations_path, f"references_{task_name}.json")
 
             # make sure tokenizer plays nice with multiprocessing
             os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -109,7 +125,10 @@ class Evaluator:
                 os.environ["HF_ALLOW_CODE_EVAL"] = "1"
             print("Evaluating generations...")
             results = task.process_results(generations, references)
-            return results
+            draft_results = task.process_results(draft_generations, references)
+            return results, draft_results, acceptance_rate
+
+
 
     def save_json_files(
         self,

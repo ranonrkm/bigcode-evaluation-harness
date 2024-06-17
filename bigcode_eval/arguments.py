@@ -33,6 +33,9 @@ class EvalArguments:
     eos: Optional[str] = field(
         default="<|endoftext|>", metadata={"help": "end of sentence token."}
     )
+    num_shots: Optional[int] = field(
+        default=None, metadata={"help": "Number of few-shot examples to include."}
+    )
     seed: Optional[int] = field(
         default=0, metadata={"help": "Random seed used for evaluation."}
     )

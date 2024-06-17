@@ -47,7 +47,7 @@ class GeneralHumanEval(Task):
 
     DATASET_PATH = "openai_humaneval"
 
-    def __init__(self, strip_prompt, k=[1, 10, 100], num_workers=16, timeout=3.0):
+    def __init__(self, strip_prompt, k=[1, 10, 100], num_workers=16, timeout=3.0, num_shots=None):
         super().__init__(
             stop_words=["\nclass", "\ndef", "\n#", "\n@", "\nprint", "\nif", "\n```", "<file_sep>"],
             requires_execution=True,
@@ -56,6 +56,8 @@ class GeneralHumanEval(Task):
         self.k = k
         self.num_workers = num_workers
         self.timeout = timeout
+        if num_shots is not None and num_shots > 0:
+            self.create_datastore()
 
     def get_dataset(self):
         """Returns dataset for the task or an iterable of any object, that get_prompt can handle"""
@@ -67,6 +69,18 @@ class GeneralHumanEval(Task):
             return doc["prompt"].strip()
         else:
             return doc["prompt"]
+
+    def get_prompt_with_fewshots(self, doc, num_shots):
+        """Does not have orig fewshots. Use self.dstore to retrieve fewshots."""
+        prompt = self.get_prompt(doc)
+        if num_shots is None or num_shots == 0:
+            return prompt
+        assert self.dstore is not None, "Datastore not created. Set num_shots to retrieve examples."
+        retrieved_examples = self.dstore.retrieve(prompt, num_shots)
+        return "\n\n".join(retrieved_examples) + \
+                "\n\nUse the above code snippets as reference to complete the following solution. Do not use any library or variable from the previous codes\n\n" + \
+                prompt
+
 
     def get_reference(self, doc):
         """Builds the reference solution for the doc (sample from the test dataset)."""

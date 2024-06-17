@@ -1,8 +1,8 @@
 from abc import ABC, abstractmethod
 from warnings import warn
-
+import torch
 from datasets import load_dataset
-
+from .retrieval import DataStore
 
 class Task(ABC):
     """A task represents an entire benchmark including its dataset, problems,
@@ -32,6 +32,20 @@ class Task(ABC):
                 This is expected behavior for the DS-1000 benchmark but not for other benchmarks!"
             )
 
+        self.dstore = None
+
+    def create_datastore(self, embedding_model_checkpoint="facebook/dragon-plus-query-encoder",
+                         index_path="/home/rsadhukh/indexes/vault/flatindexIP.index", 
+                         dataset_dir_or_name="Fsoft-AIC/the-vault-function:train_full-python",
+                         text_col="docstring",
+                         cont_col="code", 
+                         enc_pool_strategy="cls", 
+                         device=torch.device("cuda:0")):
+        self.dstore = DataStore(embedding_model_checkpoint, index_path, 
+                                dataset_dir_or_name, text_col, cont_col,
+                                enc_pool_strategy=enc_pool_strategy, 
+                                device=device)
+
     @abstractmethod
     def get_dataset(self):
         """Returns dataset for the task or an iterable of any object, that get_prompt can handle"""
@@ -46,6 +60,16 @@ class Task(ABC):
         """Builds the prompt for the LM to generate from.
         :param doc: dict[str: str]
             sample from the test dataset
+        """
+        pass
+
+    @abstractmethod
+    def get_prompt_with_fewshots(self, doc, num_shots):
+        """Builds the prompt for the LM to generate from with few-shot examples.
+        :param doc: dict[str: str]
+            sample from the test dataset
+        :param num_shots: int
+            number of few-shot examples to include
         """
         pass
 

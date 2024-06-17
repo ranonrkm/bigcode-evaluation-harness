@@ -15,10 +15,8 @@ from transformers import (
 )
 
 from bigcode_eval.arguments import EvalArguments
-# from bigcode_eval.evaluator import Evaluator
-from bigcode_eval.specdec import Evaluator
+from bigcode_eval.evaluator import Evaluator
 from bigcode_eval.tasks import ALL_TASKS
-from bigcode_eval.act_sparse_utils import griffinify_draft, catsify_draft
 
 
 class MultiChoice:
@@ -45,11 +43,6 @@ def parse_args():
         "--model",
         default="codeparrot/codeparrot-small",
         help="Model to evaluate, provide a repo name in Hugging Face hub or a local path",
-    )
-    parser.add_argument(
-        "--draft",
-        default=None,
-        help="Draft model to use",
     )
     parser.add_argument(
         "--modeltype",
@@ -99,12 +92,6 @@ def parse_args():
         type=int,
         default=512,
         help="Maximum length of generated sequence (prompt+generation)",
-    )
-    parser.add_argument(
-        "--max_new_tokens",
-        type=int,
-        default=64,
-        help="Maximum length of generated sequence (generation)",
     )
     parser.add_argument(
         "--precision",
@@ -223,31 +210,6 @@ def parse_args():
         action="store_true",
         help="Don't run generation but benchmark groundtruth (useful for debugging)",
     )
-
-    # specdec
-    parser.add_argument(
-        "--act_sparse_type",
-        type=str,
-        choices=["none", "griffin", "cats"],
-        default="none",
-        help="Type of sparse activation to use, from: none, topk, random",
-    )
-
-    parser.add_argument(
-        "--act_sparsity",
-        type=float,
-        default=0,
-        help="Ratio of activation to keep for sparse activation",
-    )
-
-    # retrieval
-    parser.add_argument(
-        "--knn_index_path",
-        type=str,
-        default=None,
-        help="Path to the knn index",
-    )
-
     return parser.parse_args()
 
 
@@ -335,23 +297,6 @@ def main():
                 args.model,
                 **model_kwargs,
             )
-            draft = AutoModelForCausalLM.from_pretrained(
-                args.draft,
-                **model_kwargs,
-            )
-
-            draft.config.is_cats = False
-            draft.config.is_griffin = False
-            # whether to sparsify model
-            if args.act_sparse_type != "none":
-                print(f"Sparsifying model with {args.act_sparse_type} sparsity")
-                if args.act_sparse_type == "griffin":
-                    draft.config.is_griffin = True
-                    draft = griffinify_draft(draft, k_factor=args.act_sparsity)
-                else:
-                    draft.config.is_cats = True
-                    draft = catsify_draft(draft, sparsity=args.act_sparsity)
-
         elif args.modeltype == "seq2seq":
             warnings.warn(
                 "Seq2Seq models have only been tested for HumanEvalPack & CodeT5+ models."
@@ -360,7 +305,6 @@ def main():
                 args.model,
                 **model_kwargs,
             )
-            draft = None
         else:
             raise ValueError(
                 f"Non valid modeltype {args.modeltype}, choose from: causal, seq2seq"
@@ -416,7 +360,7 @@ def main():
             tokenizer.bos_token_id = 1
             print("Changing bos_token to <s>")
 
-        evaluator = Evaluator(accelerator, model, draft, tokenizer, args)
+        evaluator = Evaluator(accelerator, model, tokenizer, args)
 
         if (
             args.load_generations_intermediate_paths
@@ -451,10 +395,9 @@ def main():
                         save_references_path,
                     )
             else:
-                tgt_res, drf_res, accept_rate = evaluator.evaluate(
+                results[task] = evaluator.evaluate(
                     task, intermediate_generations=intermediate_generations
                 )
-                results[task] = {"target": tgt_res, "draft": drf_res, "acceptance_rate": str(accept_rate)}
 
     # Save all args to config
     results["config"] = vars(args)
