@@ -9,6 +9,8 @@ import torch
 from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
+from .act_sparse_utils import set_mlp_mode
+
 INFILL_MODE = False
 INSTRUCTION_MODE = False
 
@@ -423,6 +425,9 @@ def complete_code_with_acceptance_rates(
 
             inputs = batch["ids"][:, : batch["input_len"]] if tokenizer.padding_side == "right" else batch["ids"]
 
+            if draft.config.is_griffin:
+                set_mlp_mode(draft, "gen")
+
             if "ids_encoder" in batch:
                 if is_wrapped:
                     generated_tokens = accelerator.unwrap_model(model).generate(
@@ -485,6 +490,10 @@ def complete_code_with_acceptance_rates(
             
             ########################## acceptance rate ##########################
             target_logits_batch = model(generated_tokens).logits
+
+            # if using griffin, set draft to lm stage, otherwise it will stay expert selection mode
+            if draft.config.is_griffin:
+                set_mlp_mode(draft, "lm")
 
             draft_logits_batch = draft(generated_tokens).logits
 

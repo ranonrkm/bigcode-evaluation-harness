@@ -17,6 +17,7 @@ from transformers import (
 from bigcode_eval.arguments import EvalArguments
 from bigcode_eval.specdec import Evaluator
 from bigcode_eval.tasks import ALL_TASKS
+from bigcode_eval.act_sparse_utils import griffinify_draft, catsify_draft
 
 
 class MultiChoice:
@@ -227,6 +228,23 @@ def parse_args():
         action="store_true",
         help="Don't run generation but benchmark groundtruth (useful for debugging)",
     )
+
+    # sparsity
+    parser.add_argument(
+        "--act_sparse_type",
+        type=str,
+        choices=["none", "griffin", "cats"],
+        default="none",
+        help="Type of sparse activation to use, from: none, topk, random",
+    )
+
+    parser.add_argument(
+        "--act_sparsity",
+        type=float,
+        default=0,
+        help="Ratio of activation to keep for sparse activation",
+    )
+
     return parser.parse_args()
 
 
@@ -318,6 +336,20 @@ def main():
                 args.draft,
                 **model_kwargs,
             )
+
+            ####### activate sparsity #######
+            draft.config.is_cats = False
+            draft.config.is_griffin = False
+            # whether to sparsify model
+            if args.act_sparse_type != "none":
+                print(f"Sparsifying model with {args.act_sparse_type} sparsity")
+                if args.act_sparse_type == "griffin":
+                    draft.config.is_griffin = True
+                    draft = griffinify_draft(draft, k_factor=1-args.act_sparsity)
+                else:
+                    draft.config.is_cats = True
+                    draft = catsify_draft(draft, sparsity=args.act_sparsity)
+
         # elif args.modeltype == "seq2seq":
         #     warnings.warn(
         #         "Seq2Seq models have only been tested for HumanEvalPack & CodeT5+ models."

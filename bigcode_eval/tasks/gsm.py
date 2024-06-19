@@ -79,7 +79,8 @@ class Gsm8k(Task):
     SPLIT = "test"
 
     def __init__(
-        self, evaluation_type: Union[str, EvaluationType] = EvaluationType.GREEDY
+        self, evaluation_type: Union[str, EvaluationType] = EvaluationType.GREEDY,
+        num_shots=NUM_SHOTS
     ):
         """
         :param evaluation_type: Union[str,EvaluationType]
@@ -94,6 +95,7 @@ class Gsm8k(Task):
             self.majority_voting = True
         else:
             self.majority_voting = False
+        self.num_shots = num_shots if num_shots is not None else NUM_SHOTS
         super().__init__(stop_words, requires_execution)
 
     def get_dataset(self):
@@ -112,11 +114,11 @@ class Gsm8k(Task):
         return examples
 
     @staticmethod
-    def few_shot_prompt(entry, text, examples):
+    def few_shot_prompt(entry, text, examples, num_shots):
         """Two shot prompt format as source & target language documentation"""
         prompt = ""
         for question, solution in zip(
-            examples["questions"][:NUM_SHOTS], examples["solutions"][:NUM_SHOTS]
+            examples["questions"][:num_shots], examples["solutions"][:num_shots]
         ):
             prompt += f'''Q: {question}\n\n# solution in Python:\n\n\ndef solution():\n    """{question}"""\n{solution}\n\n\n\n\n\n'''
         prompt += f"""Q: {text}\n\n# solution in Python:\n\n\n"""
@@ -127,7 +129,7 @@ class Gsm8k(Task):
         text = doc["question"]
         entry = f""
         examples = self.fewshot_examples()
-        prompt = self.few_shot_prompt(entry, text, examples)
+        prompt = self.few_shot_prompt(entry, text, examples, self.num_shots)
         return prompt
 
     @staticmethod
@@ -192,7 +194,8 @@ class GsmHard(Gsm8k):
     # the default split of GSMHARD - actually taken from test split of GSM dataset
     SPLIT = "train"
 
-    def __init__(self, evaluation_type: str = EvaluationType.GREEDY):
+    def __init__(self, evaluation_type: str = EvaluationType.GREEDY,
+                 num_shots=NUM_SHOTS):
         """
         :param evaluation_type: str
             Type of evaluation to perform. Authors of PAL had originally evaluated the generations on greedy and majority voting methods.
@@ -200,14 +203,14 @@ class GsmHard(Gsm8k):
             greedy: One Generation is sampled using greedy decoding and evaluated against references
             majority_voting: Predicted answer is selected from multiple generations based on majority voting and evaluated.
         """
-        super().__init__(evaluation_type)
+        super().__init__(evaluation_type, num_shots)
 
     def get_prompt(self, doc):
         """Builds the prompt for the LM to generate from."""
         text = doc["input"]
         entry = ""
         examples = self.fewshot_examples()
-        prompt = self.few_shot_prompt(entry, text, examples)
+        prompt = self.few_shot_prompt(entry, text, examples, self.num_shots)
         return prompt
 
     def get_reference(self, doc):

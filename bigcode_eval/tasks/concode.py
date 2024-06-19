@@ -24,7 +24,7 @@ _CITATION = """
   year={2018}
 }
 """
-
+NUM_SHOTS=2
 
 class Concode(Task):
     """A task represents an entire benchmark including its dataset, problems,
@@ -33,13 +33,14 @@ class Concode(Task):
 
     DATASET_PATH = "code_x_glue_tc_text_to_code"
 
-    def __init__(self, max_order=4, smooth=True):
+    def __init__(self, max_order=4, smooth=True, num_shots=NUM_SHOTS):
         super().__init__(
             stop_words=["\n"],
             requires_execution=False,
         )
         self.max_order = max_order
         self.smooth = smooth
+        self.num_shots = num_shots if num_shots is not None else NUM_SHOTS
 
     def get_dataset(self):
         """Returns dataset for the task or an iterable of any object, that get_prompt can handle"""
@@ -68,6 +69,16 @@ class Concode(Task):
         ), "Splitting operation in postprocess_generation is invalid"
         return entry + prompt
 
+    @staticmethod
+    def few_shot_prompt(entry, text, examples, num_shots):
+        """Few shot prompt format as instructions & solutions"""
+        examples = [f"\nInstruction:\n{examples[f'instruction{i}']}\nSolution:\n{examples[f'solution{i}']}" for i in range(1, num_shots + 1)]
+        prompt = "".join(examples) + f"\nInstruction:\n{text}\nSolution:\n"
+        assert (
+            prompt.count("Solution:\n") == num_shots + 1
+        ), "Splitting operation in postprocess_generation is invalid"
+        return entry + prompt
+
     def get_prompt(self, doc):
         """Builds the prompt for the LM to generate from."""
         examples = self.fewshot_examples()
@@ -75,7 +86,8 @@ class Concode(Task):
         if text.endswith("."):
             text = text[:-1].strip()
         entry = "Answer the following instructions in a one line of Java code:\n"
-        prompt = self.two_shot_prompt(entry, text, examples)
+        # prompt = self.two_shot_prompt(entry, text, examples)
+        prompt = self.few_shot_prompt(entry, text, examples, self.num_shots)
         return prompt
 
     def get_reference(self, doc):
