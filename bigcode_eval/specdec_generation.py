@@ -7,7 +7,7 @@ from accelerate.utils import set_seed
 from torch.utils.data.dataloader import DataLoader
 from transformers import StoppingCriteria, StoppingCriteriaList
 
-from bigcode_eval.utils import TokenizedDataset, complete_code
+from bigcode_eval.utils import TokenizedDataset, complete_code_with_acceptance_rates
 
 
 class EndOfFunctionCriteria(StoppingCriteria):
@@ -37,13 +37,14 @@ class TooLongFunctionCriteria(StoppingCriteria):
     def __call__(self, input_ids, scores, **kwargs):
         """Returns true if generated sequence is too long."""
         return input_ids.shape[1] > int(self.input_length * self.multiplier)
-        
+
 
 def parallel_generations(
         task,
         dataset,
         accelerator,
         model,
+        draft,
         tokenizer,
         n_tasks,
         args,
@@ -134,15 +135,18 @@ def parallel_generations(
     elif not is_loaded_in_8bit and not is_loaded_in_4bit:
         # we only wrap data loader to avoid extra memory occupation
         model = model.to(accelerator.device)
+        draft = draft.to(accelerator.device)
         ds_loader = accelerator.prepare(ds_loader)
     else:
         # model.to() is not supported for 8bit and 4bit models
         model, ds_loader = accelerator.prepare(model, ds_loader)
+        draft = accelerator.prepare(draft)
 
-    generations = complete_code(
+    generations, draft_generations, tok_acceptance_rate = complete_code_with_acceptance_rates(
         task,
         accelerator,
         model,
+        draft,
         tokenizer,
         ds_loader,
         n_tasks=n_tasks,
@@ -157,4 +161,7 @@ def parallel_generations(
         intermediate_save_generations_path=intermediate_save_generations_path,
         **gen_kwargs,
     )
-    return generations
+
+    return generations, draft_generations, tok_acceptance_rate
+
+    

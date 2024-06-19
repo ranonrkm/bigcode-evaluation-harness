@@ -355,6 +355,268 @@ def complete_code(
     generations.extend(code_gens)
     return generations
 
+def get_sampling_logits(logits :torch.Tensor, top_p:float, T: float, replicate = False):
+    if replicate:
+        logits = logits.clone()
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(
+        torch.nn.functional.softmax(sorted_logits / T, dim=-1), dim=-1)
+        filter = cumulative_probs > top_p
+        filter[..., 1:] = filter[..., :-1].clone()
+        filter[..., 0] = 0
+        indices_to_remove = filter.scatter(-1, sorted_indices, filter)
+        logits[indices_to_remove] = float('-inf')
+    return logits
+
+def complete_code_with_acceptance_rates(
+    task,
+    accelerator,
+    model,
+    draft,
+    tokenizer,
+    dataloader,
+    n_tasks,
+    limit_start=0,
+    batch_size=20,
+    prefix="",
+    instruction_tokens=None,
+    postprocess=True,
+    is_wrapped=False,
+    save_every_k_tasks: int = -1,
+    intermediate_generations: Optional[List[Optional[List[Optional[str]]]]] = None,
+    intermediate_save_generations_path: Optional[str] = None,
+    **gen_kwargs,
+):
+    """Generate multiple codes for each task in the dataset using multiple GPUs with accelerate.
+    dataloader sends all the prompts from the evalution dataset to the model as the following:
+    [p_0_0, p_0_1, ..., p_0_nc-1, p_1_0, ..., p_nt-1_nc-1] where nc is the number of copies of the prompt,
+    and nt is the number of tasks. nc is such that num_samples(for each task)= nc * batch_size
+    """
+    # keep track of the list of generated codes
+    # where len(code_gens) = n_tasks and len(code_gens[0]) = number of generated code samples
+    code_gens: List[List[Optional[str]]] = [[] for _ in range(n_tasks)]
+    draft_code_gens: List[List[Optional[str]]] = [[] for _ in range(n_tasks)]
+    generations = [] if not intermediate_generations else intermediate_generations
+    draft_generations = [] if not intermediate_generations else intermediate_generations
+    gen_token_dict = defaultdict(list)  # dict of list of generated tokens
+    draft_gen_token_dict = defaultdict(list)  # dict of list of draft generated tokens
+
+    for step, batch in tqdm(
+        enumerate(dataloader),
+        total=math.ceil(
+            n_tasks * dataloader.dataset.n_copies / accelerator.num_processes
+        ),
+    ):
+        with torch.no_grad():
+            if task.stop_words:
+                # Set the start_length after which to check for stopping to be the longest input ignoring padding
+                max_len = batch["input_len"].max().item()
+                if "ids_encoder" in batch:
+                    max_len += 1  # Add 1 for decoder_start_token_id
+                gen_kwargs["stopping_criteria"][0].start_length = max_len
+            if hasattr(task, "max_length_multiplier") and task.max_length_multiplier:
+                idx = 1 if task.stop_words else 0
+                gen_kwargs["stopping_criteria"][idx].input_length = (
+                    batch["input_len"].max().item()
+                )
+
+            inputs = batch["ids"][:, : batch["input_len"]] if tokenizer.padding_side == "right" else batch["ids"]
+
+            if "ids_encoder" in batch:
+                if is_wrapped:
+                    generated_tokens = accelerator.unwrap_model(model).generate(
+                        decoder_input_ids=inputs,
+                        input_ids=batch["ids_encoder"][:, : batch["input_len_encoder"]],
+                        num_return_sequences=batch_size,
+                        decoder_start_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                        **gen_kwargs,
+                    )
+                    draft_generated_tokens = accelerator.unwrap_model(draft).generate(
+                        decoder_input_ids=inputs,
+                        input_ids=batch["ids_encoder"][:, : batch["input_len_encoder"]],
+                        num_return_sequences=batch_size,
+                        decoder_start_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                        **gen_kwargs,
+                    )
+                else:
+                    generated_tokens = model.generate(
+                        decoder_input_ids=inputs,
+                        input_ids=batch["ids_encoder"][:, : batch["input_len_encoder"]],
+                        num_return_sequences=batch_size,
+                        decoder_start_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                        **gen_kwargs,
+                    )
+                    draft_generated_tokens = draft.generate(
+                        decoder_input_ids=inputs,
+                        input_ids=batch["ids_encoder"][:, : batch["input_len_encoder"]],
+                        num_return_sequences=batch_size,
+                        decoder_start_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                        **gen_kwargs,
+                    )
+            else:
+                if is_wrapped:
+                    # 8bit and 4bit models are wrapped in accelerator
+                    generated_tokens = accelerator.unwrap_model(model).generate(
+                        input_ids=inputs,
+                        num_return_sequences=batch_size,
+                        **gen_kwargs,
+                    )
+                    draft_generated_tokens = accelerator.unwrap_model(draft).generate(
+                        input_ids=inputs,
+                        num_return_sequences=batch_size,
+                        **gen_kwargs,
+                    )
+                else:
+                    generated_tokens = model.generate(
+                        input_ids=inputs,
+                        num_return_sequences=batch_size,
+                        **gen_kwargs,
+                    )
+                    draft_generated_tokens = draft.generate(
+                        input_ids=inputs,
+                        num_return_sequences=batch_size,
+                        **gen_kwargs,
+                    )
+            
+            ########################## acceptance rate ##########################
+            target_logits_batch = model(generated_tokens).logits
+
+            draft_logits_batch = draft(generated_tokens).logits
+
+            total_acceptance_rate = []
+            total_num_samples = []
+            T = gen_kwargs["temperature"]
+            P = gen_kwargs["top_p"]
+            for i in range(target_logits_batch.size(0)):
+                target_logits, draft_logits = target_logits_batch[i].unsqueeze(0), draft_logits_batch[i].unsqueeze(0) 
+                target_logits = get_sampling_logits(target_logits, P, T, replicate=False)
+
+                input_length = batch["input_len"]
+                num_samples = generated_tokens.size(-1) - input_length
+
+                target_logits = target_logits[...,  input_length:, : ]
+                draft_logits = draft_logits[..., input_length:, : ]
+
+                target_proba = torch.nn.functional.softmax(target_logits/T, dim=-1).unsqueeze(-1)
+                draft_proba = torch.nn.functional.softmax(draft_logits/T, dim=-1).unsqueeze(-1)
+                
+                probas = torch.cat([target_proba, draft_proba], dim=-1)
+                probas = torch.min(probas, dim=-1).values
+                acceptance_rate = probas.sum(dim=-1)
+                acceptance_rate = acceptance_rate.sum(dim=-1) / num_samples    
+                total_acceptance_rate.append(acceptance_rate.cumsum(dim=0))
+                total_num_samples.append(num_samples)
+
+            total_acceptance_rate = torch.cat(total_acceptance_rate, dim=0)
+            total_num_samples = torch.tensor(total_num_samples)
+
+            ########################## acceptance rate ##########################
+
+            # each task is generated batch_size times
+            generated_tasks = batch["task_id"].repeat(batch_size)
+            generated_tokens = accelerator.pad_across_processes(
+                generated_tokens, dim=1, pad_index=tokenizer.pad_token_id
+            )
+            draft_generated_tokens = accelerator.pad_across_processes(
+                draft_generated_tokens, dim=1, pad_index=tokenizer.pad_token_id
+            )
+
+            generated_tokens, generated_tasks = accelerator.gather(
+                (generated_tokens, generated_tasks)
+            )
+            draft_generated_tokens, generated_tasks = accelerator.gather(
+                (draft_generated_tokens, generated_tasks)
+            )
+
+            # acceptance rate calculation
+            total_acceptance_rate, total_num_samples = accelerator.gather(
+                (total_acceptance_rate, total_num_samples)
+            )
+
+            tokenwise_acceptance_rate = (total_acceptance_rate.cpu() * total_num_samples).sum() / total_num_samples.sum()
+
+            generated_tokens = generated_tokens.cpu().numpy()
+            draft_generated_tokens = draft_generated_tokens.cpu().numpy()
+            generated_tasks = generated_tasks.cpu().numpy()
+
+            for sample, generated_tokens, draft_generated_tokens in zip(generated_tasks, generated_tokens, draft_generated_tokens):
+                gen_token_dict[sample].append(generated_tokens)
+                draft_gen_token_dict[sample].append(draft_generated_tokens)
+
+            if save_every_k_tasks >= 1 and (step + 1) % save_every_k_tasks == 0:
+                if not intermediate_save_generations_path:
+                    raise ValueError(
+                        "intermediate_save_generations_path cannot be empty!"
+                    )
+
+                code_gens = update_code_gens(
+                    task,
+                    tokenizer,
+                    limit_start,
+                    prefix,
+                    instruction_tokens,
+                    postprocess,
+                    code_gens,
+                    gen_token_dict,
+                )
+
+                draft_code_gens = update_code_gens(
+                    task,
+                    tokenizer,
+                    limit_start,
+                    prefix,
+                    instruction_tokens,
+                    postprocess,
+                    draft_code_gens,
+                    draft_gen_token_dict,
+                )
+
+                with open(intermediate_save_generations_path, "w") as fp:
+                    json.dump(generations + code_gens, fp)
+                    print(
+                        f"intermediate generations were saved at {intermediate_save_generations_path}"
+                    )
+                with open(f"{intermediate_save_generations_path}.draft.jsonl", "w") as fp:
+                    json.dump(draft_generations + draft_code_gens, fp)
+                    print(
+                        f"intermediate generations were saved at {intermediate_save_generations_path}.draft.jsonl"
+                    )
+                # reset gen_token_dict - prevent redundant decoding
+                gen_token_dict = defaultdict(list)
+                draft_gen_token_dict = defaultdict(list)
+
+    code_gens = update_code_gens(
+        task,
+        tokenizer,
+        limit_start,
+        prefix,
+        instruction_tokens,
+        postprocess,
+        code_gens,
+        gen_token_dict,
+    )
+
+    draft_code_gens = update_code_gens(
+        task,
+        tokenizer,
+        limit_start,
+        prefix,
+        instruction_tokens,
+        postprocess,
+        draft_code_gens,
+        draft_gen_token_dict,
+    )
+
+    generations.extend(code_gens)
+    draft_generations.extend(draft_code_gens)
+    return generations, draft_generations, tokenwise_acceptance_rate.item()
+
+
 
 def update_code_gens(
     task,

@@ -15,7 +15,7 @@ from transformers import (
 )
 
 from bigcode_eval.arguments import EvalArguments
-from bigcode_eval.evaluator import Evaluator
+from bigcode_eval.specdec import Evaluator
 from bigcode_eval.tasks import ALL_TASKS
 
 
@@ -41,8 +41,13 @@ def parse_args():
 
     parser.add_argument(
         "--model",
-        default="codeparrot/codeparrot-small",
+        required=True,
         help="Model to evaluate, provide a repo name in Hugging Face hub or a local path",
+    )
+    parser.add_argument(
+        "--draft",
+        required=True,
+        help="Draft model to use",
     )
     parser.add_argument(
         "--modeltype",
@@ -309,17 +314,21 @@ def main():
                 args.model,
                 **model_kwargs,
             )
-        elif args.modeltype == "seq2seq":
-            warnings.warn(
-                "Seq2Seq models have only been tested for HumanEvalPack & CodeT5+ models."
-            )
-            model = AutoModelForSeq2SeqLM.from_pretrained(
-                args.model,
+            draft = AutoModelForCausalLM.from_pretrained(
+                args.draft,
                 **model_kwargs,
             )
+        # elif args.modeltype == "seq2seq":
+        #     warnings.warn(
+        #         "Seq2Seq models have only been tested for HumanEvalPack & CodeT5+ models."
+        #     )
+        #     model = AutoModelForSeq2SeqLM.from_pretrained(
+        #         args.model,
+        #         **model_kwargs,
+        #     )
         else:
             raise ValueError(
-                f"Non valid modeltype {args.modeltype}, choose from: causal, seq2seq"
+                f"Non valid modeltype {args.modeltype}, choose from: causal"
             )
 
         if args.peft_model:
@@ -372,7 +381,7 @@ def main():
             tokenizer.bos_token_id = 1
             print("Changing bos_token to <s>")
 
-        evaluator = Evaluator(accelerator, model, tokenizer, args)
+        evaluator = Evaluator(accelerator, model, draft, tokenizer, args)
 
         if (
             args.load_generations_intermediate_paths
@@ -407,9 +416,10 @@ def main():
                         save_references_path,
                     )
             else:
-                results[task] = evaluator.evaluate(
+                tgt_res, drf_res, accept_rate = evaluator.evaluate(
                     task, intermediate_generations=intermediate_generations
                 )
+                results[task] = {"target": tgt_res, "draft": drf_res, "acceptance_rate": str(accept_rate)}
 
     # Save all args to config
     results["config"] = vars(args)
